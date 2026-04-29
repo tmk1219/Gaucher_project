@@ -1,0 +1,11 @@
+# Configuration files (available upon request)
+config/
+
+# Data files
+data/
+output/
+
+# R artifacts
+.Rhistory
+.RData
+*.Rproj.user
