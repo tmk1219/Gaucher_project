@@ -1,0 +1,687 @@
+---
+title: "Gaucher Disease snRNA-seq and Bulk RNA-seq Analysis"
+subtitle: "Mitochondria-targeted restoration of mtDNA integrity suppresses cGAS-STING inflammation and rejuvenates Gaucher disease phenotypes"
+output: html_document
+date: "2026"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)
+```
+
+# Overview
+
+This document provides the computational analysis pipeline for the Gaucher disease study. Raw sequencing data are available at NCBI GEO under SuperSeries GSE325369.
+
+## Software Requirements
+
+- R (v4.4.2), Seurat (v5.3.1), MAST (v1.22.0), enrichR (v3.2), fgsea (v1.34.2)
+- Python (v3.14), pandas, matplotlib, numpy
+
+## Configuration Files
+
+Analysis parameters are defined in external configuration files under `config/`. See each section for details.
+
+```{r packages}
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(ggplot2)
+  library(dplyr)
+  library(patchwork)
+  library(MAST)
+})
+```
+
+# 1. snRNA-seq Preprocessing (Figure 3)
+
+## 1.1 Load CellRanger Output and Create Seurat Objects
+
+```{r load_data}
+# Load 10x Genomics CellRanger output for each condition
+ctrl.data    <- Read10X(data.dir = "data/Ctrl/outs/filtered_feature_bc_matrix")
+gaucher.data <- Read10X(data.dir = "data/Gaucher/outs/filtered_feature_bc_matrix")
+ma5.data     <- Read10X(data.dir = "data/Gaucher_MA5/outs/filtered_feature_bc_matrix")
+
+# Create Seurat objects
+ctrl    <- CreateSeuratObject(counts = ctrl.data,    project = "Control")
+gaucher <- CreateSeuratObject(counts = gaucher.data, project = "Gaucher")
+ma5     <- CreateSeuratObject(counts = ma5.data,     project = "Gaucher+MA5")
+```
+
+## 1.2 Quality Control and Filtering
+
+```{r qc}
+# Load QC parameters
+qc_params <- read.delim("config/qc_parameters.txt", header = TRUE)
+
+# Calculate mitochondrial gene percentage
+ctrl[["percent.mt"]]    <- PercentageFeatureSet(ctrl,    pattern = "^mt-")
+gaucher[["percent.mt"]] <- PercentageFeatureSet(gaucher, pattern = "^mt-")
+ma5[["percent.mt"]]     <- PercentageFeatureSet(ma5,     pattern = "^mt-")
+
+# Filter cells based on QC thresholds
+filter_cells <- function(obj, params) {
+  subset(obj,
+    subset = percent.mt < params$mt_max &
+             nFeature_RNA > params$nFeature_min &
+             nFeature_RNA < params$nFeature_max)
+}
+ctrl    <- filter_cells(ctrl,    qc_params)
+gaucher <- filter_cells(gaucher, qc_params)
+ma5     <- filter_cells(ma5,     qc_params)
+```
+
+## 1.3 Integration and Clustering
+
+```{r integration}
+# Load clustering parameters
+cluster_params <- read.delim("config/clustering_parameters.txt", header = TRUE)
+
+# Merge datasets
+combined <- merge(ctrl, y = c(gaucher, ma5))
+
+# Standard workflow
+combined <- NormalizeData(combined) %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA()
+
+# Clustering
+combined <- FindNeighbors(combined, dims = 1:cluster_params$n_dims)
+combined <- FindClusters(combined, resolution = cluster_params$resolution)
+combined <- RunUMAP(combined, dims = 1:cluster_params$n_dims)
+
+saveRDS(combined, file = "output/combined_seurat_object.rds")
+```
+
+## 1.4 Cell Type Annotation (Figure 3b-d)
+
+```{r annotation}
+# Cell type annotation markers from config
+annotation_markers <- read.delim("config/celltype_markers.txt", header = TRUE)
+
+celltype_colors <- c(
+  "Neuron"           = "#3498DB",
+  "Astrocyte"        = "#E67E22",
+  "Oligodendrocyte"  = "#9B59B6",
+  "Microglia"        = "#E74C3C",
+  "OPC"              = "#F1C40F",
+  "Endothelial cell" = "#1ABC9C"
+)
+
+# Cluster UMAP (Figure 3c)
+DimPlot(combined, reduction = "umap", label = TRUE, repel = TRUE)
+
+# Cell type annotation UMAP (Figure 3d)
+DimPlot(combined, reduction = "umap", group.by = "cell_type",
+        cols = celltype_colors, label = FALSE)
+
+# Top marker heatmap (Figure 3b)
+all_markers <- FindAllMarkers(combined, only.pos = TRUE,
+                               min.pct = 0.25, logfc.threshold = 0.5)
+top5 <- all_markers %>% group_by(cluster) %>% top_n(n = 5, wt = avg_log2FC)
+DoHeatmap(combined, features = top5$gene) + NoLegend()
+```
+
+## 1.5 Pathway Activity Scoring (Figure 3e)
+
+```{r pathway_scores}
+# 12 pathways from MSigDB Hallmark 2020
+# Per-cell activity score = mean log-normalized expression of constituent genes
+# Delta scores = condition mean - Control mean, scaled x10
+
+# Load pathway gene sets from config
+pathway_gene_sets <- readRDS("config/pathway_gene_sets.rds")
+
+# Compute scores
+for (pw_name in names(pathway_gene_sets)) {
+  genes <- pathway_gene_sets[[pw_name]]
+  genes_present <- intersect(genes, rownames(combined))
+  combined <- AddModuleScore(combined, features = list(genes_present),
+                              name = paste0("Score_", pw_name))
+}
+
+# Delta score calculation
+compute_delta_scores <- function(seurat_obj, score_cols, cell_types) {
+  meta <- seurat_obj@meta.data
+  ctrl_cells <- meta$orig.ident == "Control"
+
+  results <- list()
+  for (ct in cell_types) {
+    ct_cells <- meta$cell_type == ct
+    for (sc in score_cols) {
+      ctrl_mean <- mean(meta[ctrl_cells & ct_cells, sc], na.rm = TRUE)
+      for (grp in unique(meta$orig.ident)) {
+        grp_cells <- meta$orig.ident == grp & ct_cells
+        delta <- (mean(meta[grp_cells, sc], na.rm = TRUE) - ctrl_mean) * 10
+        results[[length(results) + 1]] <- data.frame(
+          CellType = ct, Pathway = sc, Group = grp, Delta = delta)
+      }
+    }
+  }
+  do.call(rbind, results)
+}
+```
+
+# 2. Signature Scores (Figure 4)
+
+## 2.1 DAM, IFN, Microglia Activation, NDMG, SASP Scores
+
+```{r signature_scores}
+# Load signature gene lists from config
+# Gene lists curated from:
+#   DAM (278 genes) - Gulen et al., 2023
+#   IFN (28 genes) - Gulen et al., 2023
+#   Microglia Activation (7 genes) - Shimizu et al., 2023
+#   NDMG (116 genes) - Gulen et al., 2023
+#   SASP (10 genes) - Victorelli et al., 2023
+# Complete gene lists available in Supplemental Table 1
+signature_lists <- readRDS("config/signature_gene_lists.rds")
+
+# Calculate scores using AddModuleScore
+for (sig_name in names(signature_lists)) {
+  genes <- signature_lists[[sig_name]]
+  genes_present <- intersect(genes, rownames(combined))
+  message(sprintf("  %s: %d / %d genes found", sig_name,
+                  length(genes_present), length(genes)))
+  combined <- AddModuleScore(combined, features = list(genes_present),
+                              name = paste0("Score_", sig_name))
+}
+
+# Visualize on UMAP (Figure 4a-e)
+score_cols <- paste0("Score_", names(signature_lists), "1")
+for (score in score_cols) {
+  if (score %in% colnames(combined@meta.data)) {
+    print(FeaturePlot(combined, features = score, split.by = "orig.ident",
+                       cols = c("grey90", "red3")))
+  }
+}
+```
+
+## 2.2 Violin Plots by Cell Type (Figure 4, right panels)
+
+```{r violin_plots}
+group_colors <- c("Control" = "#6BAED6", "GD" = "#FC9272", "GD+MA-5" = "#74C476")
+celltype_order <- c("Microglia", "Neuron", "Astrocyte",
+                    "Oligodendrocyte", "OPC", "Endothelial cell")
+
+# One-way ANOVA with Tukey post-hoc test for each cell type
+for (score_col in score_cols) {
+  if (score_col %in% colnames(combined@meta.data)) {
+    VlnPlot(combined, features = score_col, group.by = "orig.ident",
+            split.by = "cell_type", cols = group_colors)
+  }
+}
+```
+
+# 3. Microglia Subclustering (Figure 5)
+
+## 3.1 Microglia Extraction and Re-clustering
+
+```{r microglia_subcluster}
+# Load microglia subclustering parameters
+mg_params <- read.delim("config/microglia_clustering_parameters.txt", header = TRUE)
+
+# Extract microglia
+Idents(combined) <- "cell_type"
+microglia <- subset(combined, idents = "Microglia")
+
+# Filter MRC1+ macrophages
+microglia <- subset(microglia, subset = Mrc1 < mg_params$mrc1_threshold)
+
+# Re-cluster
+microglia <- NormalizeData(microglia) %>%
+  FindVariableFeatures() %>%
+  ScaleData() %>%
+  RunPCA()
+
+microglia <- FindNeighbors(microglia, dims = 1:mg_params$n_dims)
+microglia <- FindClusters(microglia, resolution = mg_params$resolution)
+microglia <- RunUMAP(microglia, dims = 1:mg_params$n_dims)
+
+# UMAP by condition (Figure 5a)
+DimPlot(microglia, reduction = "umap", split.by = "orig.ident",
+        label = TRUE, repel = TRUE)
+
+# Cluster proportions per condition
+prop_table <- table(microglia$seurat_clusters, microglia$orig.ident) %>%
+  prop.table(margin = 2) %>% round(3)
+print(prop_table)
+
+saveRDS(microglia, file = "output/microglia_subclustered.rds")
+```
+
+## 3.2 Score Visualization on Subclusters (Figure 5b-c)
+
+```{r subcluster_scores}
+# IFN and DAM scores on microglia subclusters
+FeaturePlot(microglia, features = "Score_IFN1",
+            split.by = "orig.ident", cols = c("grey90","red3"))
+FeaturePlot(microglia, features = "Score_DAM1",
+            split.by = "orig.ident", cols = c("grey90","red3"))
+```
+
+## 3.3 Cluster-Specific Marker Genes and Enrichment (Figure 5d-g)
+
+```{r cluster_markers}
+Idents(microglia) <- "seurat_clusters"
+
+# Find markers for each cluster (Wilcoxon, log2FC >= 0.5)
+all_markers <- FindAllMarkers(microglia, only.pos = TRUE,
+                               min.pct = 0.25, logfc.threshold = 0.5,
+                               test.use = "wilcox")
+
+# Export for Enrichr pathway analysis
+for (cluster_id in unique(all_markers$cluster)) {
+  markers <- all_markers %>%
+    filter(cluster == cluster_id) %>%
+    arrange(desc(avg_log2FC))
+  write.csv(markers, sprintf("output/cluster_%s_markers.csv", cluster_id),
+            row.names = FALSE)
+}
+
+# Combined Clusters 3+4 analysis (Figure 5g)
+cluster34_markers <- all_markers %>%
+  filter(cluster %in% c("3", "4")) %>%
+  arrange(desc(avg_log2FC))
+
+# Enrichr GO BP and KEGG enrichment
+library(enrichR)
+enrichr_results <- enrichr(head(cluster34_markers$gene, 250),
+                            databases = c("GO_Biological_Process_2023",
+                                          "KEGG_2021_Human"))
+```
+
+# 4. SCAFE Downstream Analysis (Figure 6)
+
+SCAFE (Single-Cell Analysis of Five-prime Ends) was used to process 5' single-cell RNA-seq data. Microglia-specific cell barcodes were extracted from the snRNA-seq clusters. TSS data were converted to bigWig format using UCSC bedGraphToBigWig.
+
+## 4.1 CRE Activity Quantification
+
+```{r cre_quantification}
+library(rtracklayer)
+library(GenomicRanges)
+
+# Load bigWig files (SCAFE output, TPM-normalized)
+bw_ctrl <- import("data/scafe/Control_microglia.bw")
+bw_gd   <- import("data/scafe/GD_microglia.bw")
+bw_ma5  <- import("data/scafe/MA5_microglia.bw")
+
+# Load tCRE definitions and classification parameters
+tcre_params <- read.delim("config/tcre_classification_parameters.txt", header = TRUE)
+
+# tCRE classification: promoter (<500bp from TSS) vs enhancer (>500bp, bidirectional)
+# 35,891 enhancer and 22,702 promoter tCREs identified
+```
+
+## 4.2 Genome Track Visualization (Figure 6c-i)
+
+```{r genome_tracks}
+library(Gviz)
+library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+
+txdb <- TxDb.Mmusculus.UCSC.mm10.knownGene
+
+plot_gene_tracks <- function(gene_symbol, chr, start, end) {
+  genome_track <- GenomeAxisTrack()
+  gene_track <- GeneRegionTrack(txdb, chromosome = chr, start = start, end = end,
+                                 name = gene_symbol)
+  data_tracks <- list(
+    DataTrack(bw_ctrl, chromosome = chr, from = start, to = end,
+              name = "Control", type = "h", col = "navy"),
+    DataTrack(bw_gd, chromosome = chr, from = start, to = end,
+              name = "GD", type = "h", col = "navy"),
+    DataTrack(bw_ma5, chromosome = chr, from = start, to = end,
+              name = "GD+MA-5", type = "h", col = "navy")
+  )
+  plotTracks(c(genome_track, data_tracks, gene_track), from = start, to = end)
+}
+
+# Genomic loci defined in config
+loci <- read.delim("config/genomic_loci.txt", header = TRUE)
+for (i in seq_len(nrow(loci))) {
+  plot_gene_tracks(loci$gene[i], loci$chr[i], loci$start[i], loci$end[i])
+}
+```
+
+# 5. Bulk RNA-seq Analysis (Figures 8-9)
+
+Differential expression analysis for bulk RNA-seq (iPSC-derived microglia and mouse liver) was performed using CLC Genomics Workbench. The resulting DEG tables were exported and used for downstream pathway analysis and visualization in R.
+
+## 5.1 Load DEG Results and PCA (Figure 8p, 9d)
+
+```{r bulk_load}
+# Load CLC Genomics Workbench output tables
+# iPSC-derived microglia (GEO: GSE325368)
+deg_iMG_gd  <- read.csv("data/bulk_rnaseq/iMG_DEG_GD_vs_Control.csv", row.names = 1)
+deg_iMG_ma5 <- read.csv("data/bulk_rnaseq/iMG_DEG_MA5_vs_GD.csv", row.names = 1)
+iMG_expr    <- read.csv("data/bulk_rnaseq/iMG_bulk_expression.csv", row.names = 1)
+
+# Mouse liver (GEO: GSE325367)
+deg_liver_gd  <- read.csv("data/bulk_rnaseq/liver_DEG_GD_vs_Control.csv", row.names = 1)
+deg_liver_ma5 <- read.csv("data/bulk_rnaseq/liver_DEG_MA5_vs_GD.csv", row.names = 1)
+liver_tpm     <- read.csv("data/bulk_rnaseq/liver_tpm.csv", row.names = 1)
+```
+
+```{r pca}
+group_colors <- c("Control" = "#95C9FF", "Gaucher" = "#FF9B8E", "Gaucher+MA5" = "#A3E6A4")
+
+create_pca_plot <- function(expr_matrix, sample_groups, title) {
+  pca_res <- prcomp(t(log2(expr_matrix + 1)), scale. = TRUE)
+  pca_df  <- data.frame(pca_res$x[, 1:2], Group = sample_groups)
+  var_exp <- summary(pca_res)$importance[2, 1:2] * 100
+
+  ggplot(pca_df, aes(x = PC1, y = PC2, color = Group)) +
+    geom_point(size = 4, stroke = 1) +
+    stat_ellipse(level = 0.95, linetype = "dashed") +
+    scale_color_manual(values = group_colors) +
+    labs(x = sprintf("PC1 (%.1f%%)", var_exp[1]),
+         y = sprintf("PC2 (%.1f%%)", var_exp[2]),
+         title = title) +
+    theme_bw(base_family = "Arial") +
+    theme(legend.position = "right")
+}
+```
+
+## 5.2 Pathway Enrichment Analysis (Figure 8r, 9e-f)
+
+```{r pathway_enrichment}
+library(enrichR)
+
+# Load DEG filtering thresholds
+deg_params <- read.delim("config/deg_filter_parameters.txt", header = TRUE)
+
+identify_rescue_genes <- function(deg_gd, deg_ma5, params) {
+  up_in_gd    <- rownames(deg_gd[deg_gd$logFC > params$logfc_thresh &
+                                  deg_gd$adj.P.Val < params$p_thresh, ])
+  down_by_ma5 <- rownames(deg_ma5[deg_ma5$logFC < -params$logfc_thresh &
+                                   deg_ma5$adj.P.Val < params$p_thresh, ])
+  intersect(up_in_gd, down_by_ma5)
+}
+
+rescue_genes_iMG   <- identify_rescue_genes(deg_iMG_gd,   deg_iMG_ma5,   deg_params)
+rescue_genes_liver <- identify_rescue_genes(deg_liver_gd, deg_liver_ma5, deg_params)
+
+enrichr_databases <- c("MSigDB_Hallmark_2020", "Reactome_2022",
+                        "TRRUST_Transcription_Factors_2019",
+                        "BioPlanet_2019", "GO_Biological_Process_2023")
+
+enrichr_iMG   <- enrichr(rescue_genes_iMG,   databases = enrichr_databases)
+enrichr_liver <- enrichr(rescue_genes_liver, databases = enrichr_databases)
+```
+
+## 5.3 GSEA (Figures 8q, 9g)
+
+```{r gsea}
+library(fgsea)
+library(msigdbr)
+
+m_hallmark  <- msigdbr(species = "Mus musculus", collection = "H")
+m_c2        <- msigdbr(species = "Mus musculus", collection = "C2")
+m_kegg      <- m_c2[grepl("^KEGG_", m_c2$gs_name), ]
+m_reactome  <- m_c2[grepl("^REACTOME_", m_c2$gs_name), ]
+
+pathways <- split(
+  c(m_hallmark$gene_symbol, m_kegg$gene_symbol, m_reactome$gene_symbol),
+  c(m_hallmark$gs_name, m_kegg$gs_name, m_reactome$gs_name)
+)
+
+run_gsea <- function(deg_table) {
+  ranked <- setNames(deg_table$logFC, rownames(deg_table))
+  ranked <- sort(ranked, decreasing = TRUE)
+  fgseaMultilevel(pathways, ranked, nPermSimple = 10000)
+}
+
+gsea_iMG_gd    <- run_gsea(deg_iMG_gd)
+gsea_iMG_ma5   <- run_gsea(deg_iMG_ma5)
+gsea_liver_gd  <- run_gsea(deg_liver_gd)
+gsea_liver_ma5 <- run_gsea(deg_liver_ma5)
+```
+
+## 5.4 Volcano Plots
+
+```{r volcano}
+colors <- c("Up" = "#FF7A6E", "Down" = "#5BA3E0", "NS" = "grey80")
+
+create_volcano <- function(deg_table, title, fc_thresh = 1, p_thresh = 0.05) {
+  deg_table$direction <- ifelse(
+    deg_table$logFC > fc_thresh & deg_table$adj.P.Val < p_thresh, "Up",
+    ifelse(deg_table$logFC < -fc_thresh & deg_table$adj.P.Val < p_thresh, "Down", "NS"))
+
+  ggplot(deg_table, aes(x = logFC, y = -log10(adj.P.Val), color = direction)) +
+    geom_point(size = 1, alpha = 0.7) +
+    scale_color_manual(values = colors) +
+    geom_hline(yintercept = -log10(p_thresh), linetype = "dashed") +
+    geom_vline(xintercept = c(-fc_thresh, fc_thresh), linetype = "dashed") +
+    labs(title = title, x = "log2 Fold Change", y = "-log10(adj. P)") +
+    theme_bw(base_family = "Arial")
+}
+
+create_volcano(deg_iMG_gd,    "iPSC Microglia: GD vs Control")
+create_volcano(deg_iMG_ma5,   "iPSC Microglia: GD+MA-5 vs GD")
+create_volcano(deg_liver_gd,  "Liver: GD vs Control")
+create_volcano(deg_liver_ma5, "Liver: GD+MA-5 vs GD")
+```
+
+# 6. Transcriptomic Age Analysis (Figure 7)
+
+Transcriptomic age (tAge) was estimated using rodent multi-tissue chronological and mortality transcriptomic clocks based on the Bayesian Ridge algorithm. tAge analysis was performed using the tAge framework (https://github.com/Gladyshev-Lab/tAge; Tyshkovskiy et al., 2024).
+
+## 6.1 Metacell Construction
+
+```{r metacell}
+# Construct non-overlapping metacells from snRNA-seq data
+# Parameters from config
+metacell_params <- read.delim("config/metacell_parameters.txt", header = TRUE)
+
+construct_metacells <- function(seurat_obj, cell_type, params) {
+  cells <- WhichCells(seurat_obj, expression = cell_type_annotation == cell_type)
+  counts <- GetAssayData(seurat_obj, slot = "counts")[, cells]
+
+  total_reads <- colSums(counts)
+  metacells <- list()
+  remaining <- seq_along(cells)
+
+  while (length(remaining) > 0) {
+    cumsum_reads <- cumsum(total_reads[remaining])
+    idx <- which(cumsum_reads >= params$target_reads)[1]
+    if (is.na(idx)) break
+    metacells[[length(metacells) + 1]] <- remaining[1:idx]
+    remaining <- remaining[(idx + 1):length(remaining)]
+  }
+
+  mc_counts <- sapply(metacells, function(idx) {
+    rowSums(counts[, idx, drop = FALSE])
+  })
+
+  keep <- colSums(mc_counts) >= params$min_reads
+  mc_counts[, keep]
+}
+```
+
+## 6.2 Normalization and Clock Application
+
+```{r tage_norm}
+# Normalization parameters from config
+norm_params <- read.delim("config/normalization_parameters.txt", header = TRUE)
+
+normalize_metacells <- function(mc_counts, params) {
+  pct_expressed <- rowMeans(mc_counts >= params$min_reads_per_gene)
+  mc_counts <- mc_counts[pct_expressed >= params$min_pct_expressed, ]
+
+  log_expr <- log2(mc_counts + 1)
+
+  # RLE normalization
+  median_expr <- apply(log_expr, 1, median)
+  ratios <- sweep(log_expr, 1, median_expr, "-")
+  size_factors <- apply(ratios, 2, median)
+  normalized <- sweep(log_expr, 2, size_factors, "-")
+
+  scaled <- t(scale(t(normalized)))
+  return(scaled)
+}
+
+# Apply tAge clock (Tyshkovskiy et al., 2024)
+# Clock model from: https://github.com/Gladyshev-Lab/tAge
+# Rodent multi-tissue chronological and mortality clocks (Bayesian Ridge)
+predict_tage <- function(scaled_expr, clock_model) {
+  clock_genes <- names(clock_model$coefficients)
+  common_genes <- intersect(rownames(scaled_expr), clock_genes)
+
+  # Impute missing clock genes with pre-calculated averages
+  missing_genes <- setdiff(clock_genes, common_genes)
+  if (length(missing_genes) > 0) {
+    imputed <- matrix(clock_model$imputation_values[missing_genes],
+                      nrow = length(missing_genes), ncol = ncol(scaled_expr))
+    rownames(imputed) <- missing_genes
+    scaled_expr <- rbind(scaled_expr[common_genes, ], imputed)
+  }
+
+  expr_subset <- scaled_expr[clock_genes, ]
+  tage <- clock_model$intercept + colSums(expr_subset * clock_model$coefficients[clock_genes])
+  return(tage)
+}
+
+# Compare groups using mixed-effects model (metafor)
+library(metafor)
+compare_tage <- function(tage_values, groups, cell_type) {
+  df <- data.frame(tage = tage_values, group = groups)
+  # Pairwise comparisons with Benjamini-Hochberg correction
+  pairwise_results <- pairwise.t.test(df$tage, df$group, p.adjust.method = "BH")
+  return(pairwise_results)
+}
+```
+
+## 6.3 tAge Visualization (Figure 7a,c)
+
+```{r tage_plot}
+tage_data <- read.csv("data/tage/Predicted_tAges_Gaucher_dataset.csv")
+colnames(tage_data) <- gsub("^\uFEFF", "", colnames(tage_data))
+
+tage_data$Group <- factor(
+  ifelse(tage_data$Group == "Control", "Control",
+  ifelse(tage_data$Group == "Gaucher", "GD", "GD+MA-5")),
+  levels = c("Control", "GD", "GD+MA-5"))
+
+group_colors <- c("Control" = "#6BAED6", "GD" = "#FC9272", "GD+MA-5" = "#74C476")
+
+celltype_order <- c("microglia", "neuron", "astrocyte",
+                    "oligodendrocyte", "opc", "endothelial cell")
+tage_data$Cell.type <- factor(tolower(tage_data$Cell.type), levels = celltype_order)
+
+create_tage_dotplot <- function(data, value_col, title) {
+  df <- data.frame(
+    Celltype = data$Cell.type,
+    Group    = data$Group,
+    Value    = data[[value_col]]
+  ) %>% filter(!is.na(Value))
+
+  plots <- list()
+  for (ct in levels(df$Celltype)) {
+    ct_data <- df %>% filter(Celltype == ct)
+    if (nrow(ct_data) == 0) next
+
+    p <- ggplot(ct_data, aes(x = Group, y = Value, fill = Group)) +
+      geom_boxplot(alpha = 0.3, outlier.shape = NA, width = 0.6) +
+      geom_jitter(aes(color = Group), width = 0.15, size = 2.5, alpha = 0.8) +
+      scale_fill_manual(values = group_colors) +
+      scale_color_manual(values = group_colors) +
+      labs(title = tools::toTitleCase(ct), y = title, x = NULL) +
+      theme_bw(base_family = "Arial") +
+      theme(legend.position = "none",
+            plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+            axis.text.x = element_text(angle = 45, hjust = 1))
+    plots[[ct]] <- p
+  }
+
+  wrap_plots(plots, nrow = 1)
+}
+
+create_tage_dotplot(tage_data, "tAge_chronological", "Chronological tAge")
+create_tage_dotplot(tage_data, "tAge_mortality", "Mortality tAge")
+```
+
+## 6.4 Gene Contribution to tAge (Figure 7d)
+
+```{r tage_gene_contribution}
+gene_contrib_gd  <- read.csv("data/tage/Gene_contribution_mortality_microglia_Gaucher.csv",
+                              row.names = 1)
+gene_contrib_ma5 <- read.csv("data/tage/Gene_contribution_mortality_microglia_GaucherMA5.csv",
+                              row.names = 1)
+
+prep_barplot_data <- function(df, n_top = 24) {
+  df$abs_slope <- abs(df$Slope.Clock)
+  df <- df[order(-df$abs_slope), ][1:n_top, ]
+  df <- df[order(df$Slope.Clock), ]
+  df
+}
+
+top_gd  <- prep_barplot_data(gene_contrib_gd)
+top_ma5 <- prep_barplot_data(gene_contrib_ma5, n_top = 25)
+
+color_up   <- "#E74C3C"
+color_down <- "#5DADE2"
+
+create_contribution_barplot <- function(df, title) {
+  df$gene_f <- factor(df$Gene.symbol, levels = df$Gene.symbol)
+
+  ggplot(df, aes(x = gene_f, y = Slope.Clock, fill = Direction)) +
+    geom_bar(stat = "identity", width = 0.7) +
+    geom_errorbar(aes(ymin = Slope.Clock - SE.Clock,
+                      ymax = Slope.Clock + SE.Clock), width = 0.2) +
+    scale_fill_manual(values = c("Upregulated" = color_up,
+                                  "Downregulated" = color_down)) +
+    coord_flip() +
+    labs(title = title, x = NULL,
+         y = expression("Effect on tAge, " * log[10] * "HR")) +
+    theme_bw(base_family = "Arial") +
+    theme(axis.text.y = element_text(size = 10))
+}
+
+create_contribution_barplot(top_gd,  "GD vs Control")
+create_contribution_barplot(top_ma5, "GD+MA-5 vs GD")
+```
+
+# 7. Spearman Correlation and GSEA Heatmaps (Figure 7a-b)
+
+```{r correlation_gsea_heatmap}
+cor_matrix  <- read.csv("data/gsea/Correlation_table_genes_Spearman.csv",
+                         row.names = 1, check.names = FALSE)
+padj_matrix <- read.csv("data/gsea/Correlation_table_genes_Spearman_padjusted.csv",
+                         row.names = 1, check.names = FALSE)
+
+nes_matrix  <- read.csv("data/gsea/GSEA_matrix_NES.csv",
+                         row.names = 1, check.names = FALSE)
+nes_padj    <- read.csv("data/gsea/GSEA_matrix_p.adjusted.csv",
+                         row.names = 1, check.names = FALSE)
+
+get_sig_label <- function(p) {
+  ifelse(p < 0.001, "***",
+  ifelse(p < 0.01, "**",
+  ifelse(p < 0.05, "*",
+  ifelse(p < 0.1, "^", ""))))
+}
+
+library(reshape2)
+
+plot_heatmap <- function(mat, padj_mat, title, fill_label = "NES") {
+  melted <- melt(as.matrix(mat))
+  colnames(melted) <- c("Row", "Col", "Value")
+  melted$Label <- get_sig_label(as.vector(as.matrix(padj_mat)))
+
+  ggplot(melted, aes(Col, Row, fill = Value)) +
+    geom_tile(colour = "black", linewidth = 0.1) +
+    scale_fill_gradient2(high = "red3", low = "blue3", mid = "white",
+                          guide = "colorbar") +
+    geom_text(aes(label = Label), size = 3, color = "white", fontface = "bold") +
+    labs(x = "", y = "", fill = fill_label) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+}
+```
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```
